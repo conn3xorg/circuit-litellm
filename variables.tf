@@ -108,6 +108,35 @@ variable "models" {
   }
 }
 
+variable "guardrails" {
+  type        = any
+  default     = []
+  description = "LiteLLM's guardrails list, such as [{ guardrail_name = \"presidio-pii\", litellm_params = { guardrail = \"presidio\", mode = \"pre_call\", default_on = true } }]. It's written to config.yaml as it is, so give keys as os.environ/NAME references to api_keys."
+
+  validation {
+    condition     = can(length(var.guardrails)) && alltrue([for g in var.guardrails : can(tostring(g.guardrail_name)) && can(tostring(g.litellm_params.guardrail))])
+    error_message = "guardrails must be a list of objects, each with a guardrail_name and litellm_params with a guardrail, such as { guardrail_name = \"presidio-pii\", litellm_params = { guardrail = \"presidio\", mode = \"pre_call\" } }."
+  }
+
+  # As in models: a credential here would be plain text in the plan, state
+  # and config.yaml.
+  validation {
+    condition     = alltrue(flatten([for g in var.guardrails : [for k, v in g.litellm_params : !can(regex("(?i)(key|secret|password|credentials|(access|session|auth)_token)$", k)) || startswith(try(tostring(v), ""), "os.environ/")]]))
+    error_message = "Credentials in a guardrail's litellm_params, such as api_key, must be os.environ/NAME references, with the value itself in api_keys."
+  }
+}
+
+variable "langfuse_url" {
+  type        = string
+  default     = null
+  description = "Base URL of a Langfuse 3 or later to send a trace of every model call to over OpenTelemetry, such as \"http://127.0.0.1:3000\". Put the project's LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY in api_keys. When null, nothing is sent."
+
+  validation {
+    condition     = var.langfuse_url == null || can(regex("^https?://[^/\\s]+(/.*)?$", var.langfuse_url))
+    error_message = "langfuse_url must be an http:// or https:// URL, such as \"http://127.0.0.1:3000\"."
+  }
+}
+
 variable "api_keys" {
   type        = map(string)
   default     = {}
@@ -125,12 +154,17 @@ variable "api_keys" {
     condition     = length(setintersection(keys(var.api_keys), ["DATABASE_URL", "LITELLM_MASTER_KEY", "LITELLM_SALT_KEY"])) == 0
     error_message = "Set DATABASE_URL with db_connection_uri. LITELLM_MASTER_KEY and LITELLM_SALT_KEY are generated on the host."
   }
+
+  validation {
+    condition     = var.langfuse_url == null || length(setintersection(keys(var.api_keys), ["LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY"])) == 2
+    error_message = "With langfuse_url set, api_keys needs the project's LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY."
+  }
 }
 
 variable "log_prompts" {
   type        = bool
   default     = false
-  description = "Store each request's messages and the model's answer in LiteLLM's spend logs, in PostgreSQL, where admins can read them in the UI. Off by default: the logs then hold who called which model, when, with how many tokens and at what cost, but not what was said."
+  description = "Store each request's messages and the model's answer in LiteLLM's spend logs, in PostgreSQL, where admins can read them in the UI, and with langfuse_url, in each Langfuse trace. Off by default: the logs and traces then hold who called which model, when, with how many tokens and at what cost, but not what was said."
 }
 
 variable "spend_logs" {

@@ -11,24 +11,39 @@ locals {
   )
   key_limits = [{}, { max_budget = var.max_key_budget }][var.max_key_budget == null ? 0 : 1]
 
+  # LiteLLM's Langfuse exporter finds Langfuse in its environment, not
+  # config.yaml. Its newer OpenTelemetry logger, LITELLM_OTEL_V2, isn't used:
+  # in v1.106.6 it also prints every span inside the proxy, guardrail
+  # findings included, to the journal.
+  langfuse_env = var.langfuse_url == null ? {} : { LANGFUSE_OTEL_HOST = var.langfuse_url }
+  # Added to any callbacks given in litellm_settings rather than replacing them.
+  callbacks = distinct(concat(try(var.litellm_settings.callbacks, []), var.langfuse_url == null ? [] : ["langfuse_otel"]))
+
   # Merged at the top level only: a key set in general_settings or
   # litellm_settings replaces the circuit's value for that key whole.
-  config = {
-    model_list = var.models
-    general_settings = merge(
-      {
-        store_prompts_in_spend_logs = var.log_prompts
-        disable_spend_logs          = !var.spend_logs
-      },
-      var.general_settings,
-    )
-    litellm_settings = merge(
-      { drop_params = true },
-      [{}, { default_key_generate_params = local.key_defaults }][length(local.key_defaults) == 0 ? 0 : 1],
-      [{}, { upperbound_key_generate_params = local.key_limits }][length(local.key_limits) == 0 ? 0 : 1],
-      var.litellm_settings,
-    )
-  }
+  config = merge(
+    {
+      model_list = var.models
+      general_settings = merge(
+        {
+          store_prompts_in_spend_logs = var.log_prompts
+          disable_spend_logs          = !var.spend_logs
+        },
+        var.general_settings,
+      )
+      litellm_settings = merge(
+        { drop_params = true },
+        [{}, { default_key_generate_params = local.key_defaults }][length(local.key_defaults) == 0 ? 0 : 1],
+        [{}, { upperbound_key_generate_params = local.key_limits }][length(local.key_limits) == 0 ? 0 : 1],
+        # Without it, traces carry each request and answer whatever log_prompts says.
+        [{}, { turn_off_message_logging = !var.log_prompts }][var.langfuse_url == null ? 0 : 1],
+        var.litellm_settings,
+        [{}, { callbacks = local.callbacks }][length(local.callbacks) == 0 ? 0 : 1],
+      )
+    },
+    # Left out when empty, so config.yaml doesn't change for anyone without.
+    [{}, { guardrails = var.guardrails }][length(var.guardrails) == 0 ? 0 : 1],
+  )
 
   # Where the host itself reaches LiteLLM, to check it's up.
   local_host = lookup({ "0.0.0.0" = "127.0.0.1", "::" = "[::1]" }, var.listen_address, strcontains(var.listen_address, ":") ? "[${var.listen_address}]" : var.listen_address)
@@ -106,7 +121,7 @@ module "podman" {
       image   = local.image
       volumes = ["${local.etc}/config.yaml:/app/config.yaml:ro,Z"]
       # Without this, every start fetches model prices from GitHub.
-      environment = var.fetch_model_prices ? {} : { LITELLM_LOCAL_MODEL_COST_MAP = "True" }
+      environment = merge(var.fetch_model_prices ? {} : { LITELLM_LOCAL_MODEL_COST_MAP = "True" }, local.langfuse_env)
       extra = [
         "Network=host",
         "EnvironmentFile=${local.keys_file}",
@@ -142,7 +157,7 @@ circuit "ready" {
     command {
       command  = "for _ in $(seq 600); do ${local.healthy} && exit 0; sleep 1; done; echo 'LiteLLM did not come up in 10 minutes. See journalctl -u litellm.' >&2; exit 1"
       unless   = local.healthy
-      triggers = sha256("${local.image} ${var.listen_address} ${var.port} ${local.config_yaml}")
+      triggers = sha256("${local.image} ${var.listen_address} ${var.port} ${local.config_yaml}${length(local.langfuse_env) == 0 ? "" : jsonencode(local.langfuse_env)}")
     }
   }
 }
