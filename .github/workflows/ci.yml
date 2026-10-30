@@ -1,0 +1,162 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Conn3x
+        env: &gh
+          GH_TOKEN: ${{ github.token }}
+        run: &install |
+          tag=$(gh release view -R conn3xorg/conn3x --json tagName -q .tagName)
+          file="conn3x_${tag#v}_linux_amd64.tar.gz"
+          cd "$RUNNER_TEMP"
+          curl -sSfLO "https://github.com/conn3xorg/conn3x/releases/download/$tag/$file"
+          curl -sSfLO "https://github.com/conn3xorg/conn3x/releases/download/$tag/checksums.txt"
+          grep " $file\$" checksums.txt | sha256sum -c -
+          mkdir -p bin && tar -xzf "$file" -C bin conn3x
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - run: conn3x version
+      - run: conn3x fmt -check -recursive
+      - name: Validate
+        run: conn3x init -backend=false && conn3x validate
+      - name: Validate the example
+        working-directory: examples/local
+        run: conn3x init -backend=false && conn3x validate
+
+  e2e:
+    needs: validate
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [rocky10, fedora45, ubuntu2404, debian13]
+    name: e2e (${{ matrix.distro }})
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The test host images live in the Conn3x repo.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: conn3xorg/conn3x
+          ref: main
+          path: conn3x
+          persist-credentials: false
+          sparse-checkout: test/images
+      - name: Install Conn3x
+        env: *gh
+        run: *install
+      - name: Start the ${{ matrix.distro }} host
+        working-directory: examples/local
+        env:
+          CONTAINERFILE: ${{ github.workspace }}/conn3x/test/images/${{ matrix.distro }}/Containerfile
+          # Podman in the host container needs a rootful, privileged container.
+          PODMAN: sudo podman
+        run: ./up.sh
+      - name: Apply, then plan again with no changes
+        working-directory: examples/local
+        run: |
+          conn3x init
+          conn3x apply -auto-approve
+          conn3x plan -detailed-exitcode
+      # A stand-in for an OpenAI-compatible provider, so CI needs no real
+      # API key. It answers only the key that reached LiteLLM through
+      # api_keys, and gives every reply its own id, which LiteLLM's spend
+      # logs use as their primary key. It runs in the LiteLLM container,
+      # which has Python and shares the host's network.
+      - name: Write a stand-in model provider
+        run: |
+          sudo podman exec -i circuit-litellm sh -c 'cat > /root/stand_in.py' <<'EOF'
+          import json, uuid
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+
+          class Handler(BaseHTTPRequestHandler):
+              def do_POST(self):
+                  req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                  if self.headers.get("Authorization") != "Bearer not-a-real-key":
+                      self.send_response(401)
+                      self.end_headers()
+                      return
+                  body = json.dumps({
+                      "id": "chatcmpl-" + uuid.uuid4().hex, "object": "chat.completion", "created": 0,
+                      "model": req["model"],
+                      "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "pong"}}],
+                      "usage": {"prompt_tokens": 1000, "completion_tokens": 500, "total_tokens": 1500},
+                  }).encode()
+                  self.send_response(200)
+                  self.send_header("Content-Type", "application/json")
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+
+          HTTPServer(("127.0.0.1", 9999), Handler).serve_forever()
+          EOF
+          sudo podman exec -i circuit-litellm sh -c 'cat > /root/req.py' <<'EOF'
+          # req.py PATH KEY [JSON]: prints the status and the body.
+          import sys, urllib.request, urllib.error
+          data = sys.argv[3].encode() if len(sys.argv) > 3 else None
+          r = urllib.request.Request("http://127.0.0.1:4000" + sys.argv[1], data,
+              {"Authorization": "Bearer " + sys.argv[2], "Content-Type": "application/json"})
+          try:
+              with urllib.request.urlopen(r) as resp:
+                  code, body = resp.status, resp.read()
+          except urllib.error.HTTPError as e:
+              code, body = e.code, e.read()
+          except OSError:
+              code, body = 0, b""
+          print(code, body.decode())
+          EOF
+      # Makes a virtual key for one model with the master key from the
+      # host, uses it, and is refused the other model. The spend log row has
+      # to reach PostgreSQL, priced but without the request or the
+      # answer, since log_prompts is off. After a restart the same key
+      # still works, which needs the database and both generated keys
+      # unchanged.
+      - name: Check health, a virtual key, spend logs, and a restart
+        run: |
+          sudo podman exec -i circuit-litellm sh -eu <<'EOF'
+          r() { podman exec -i litellm python - "$@" < /root/req.py; }
+          stand_in() { podman exec -d litellm python -c "$(cat /root/stand_in.py)" >/dev/null; sleep 2; }
+          stand_in
+          sql() { runuser -u postgres -- psql -d litellm -tAc "$1"; }
+          ask='{"model":"%s","messages":[{"role":"user","content":"ping"}]}'
+          r /health/liveliness - | grep -q '^200 '
+          mk=$(sed -n 's/^LITELLM_MASTER_KEY=//p' /etc/litellm/keys.env)
+          r /key/generate not-the-master-key '{"models":["small"]}' | grep -q '^401 '
+          vk=$(r /key/generate "$mk" '{"models":["small"]}' | sed -n 's/.*"key": *"\(sk-[^"]*\)".*/\1/p')
+          [ -n "$vk" ]
+          r /key/generate "$mk" '{"max_budget":50}' | grep -q '^400 .*max_budget is over max limit'
+          r /v1/chat/completions "$vk" "$(printf "$ask" small)" | grep -q '^200 .*"content":"pong"'
+          r /v1/chat/completions "$vk" "$(printf "$ask" large)" | grep -q '^403 '
+          q='select count(*) from "LiteLLM_SpendLogs" where model_group = '"'small'"' and status = '"'success'"' and spend > 0'
+          for _ in $(seq 120); do [ "$(sql "$q")" -ge 1 ] && break; sleep 1; done
+          [ "$(sql "$q")" -ge 1 ]
+          e="('{}', 'null')"
+          [ "$(sql "select count(*) from \"LiteLLM_SpendLogs\" where messages::text not in $e or response::text not in $e or proxy_server_request::text not in $e")" -eq 0 ]
+          r "/key/info?key=$vk" "$mk" | grep -q '"max_budget":1.0'
+          systemctl restart litellm
+          for _ in $(seq 120); do r /health/liveliness - | grep -q '^200 ' && break; sleep 1; done
+          stand_in
+          r /v1/chat/completions "$vk" "$(printf "$ask" small)" | grep -q '^200 .*"content":"pong"'
+          r /v1/chat/completions "$vk" "$(printf "$ask" large)" | grep -q '^403 '
+          echo "All checks passed."
+          EOF
+      - name: Clean up
+        if: always()
+        working-directory: examples/local
+        env:
+          PODMAN: sudo podman
+        run: ./down.sh
