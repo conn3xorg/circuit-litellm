@@ -139,6 +139,75 @@ module "litellm" {
 }
 ```
 
+### Masking PII with Presidio
+
+LiteLLM can send every request through [Presidio](https://github.com/conn3xorg/circuit-presidio) before a model sees it. Names, email addresses and whatever else you choose are swapped for placeholders, so `My name is David Johnson` reaches OpenAI as `My name is <PERSON>`. That's `guardrails`, LiteLLM's own [guardrails list](https://docs.litellm.ai/docs/proxy/guardrails/pii_masking_v2), written to `config.yaml` as you give it. With circuit-presidio on the same host, both of Presidio's services are on loopback, where LiteLLM reaches them:
+
+```hcl
+module "presidio" {
+  source = "github.com/conn3xorg/circuit-presidio?ref=v0.1.0"
+
+  hosts                = { gateway = "192.168.1.50" }
+  ssh_private_key_file = "~/.ssh/id_ed25519"
+}
+
+module "litellm" {
+  # ...as above, with module.presidio added to depends_on, and:
+  guardrails = [{
+    guardrail_name = "presidio-pii"
+    litellm_params = {
+      guardrail                    = "presidio"
+      mode                         = "pre_call"
+      default_on                   = true
+      presidio_analyzer_api_base   = "http://127.0.0.1:5002"
+      presidio_anonymizer_api_base = "http://127.0.0.1:5001"
+      presidio_language            = "en"
+      pii_entities_config = {
+        PERSON        = "MASK"
+        EMAIL_ADDRESS = "MASK"
+        PHONE_NUMBER  = "MASK"
+        CREDIT_CARD   = "BLOCK"
+      }
+    }
+  }]
+}
+```
+
+`mode = "pre_call"` checks what goes to the model; `["pre_call", "post_call"]` checks the answer too. `default_on = true` runs it on every request, rather than only on those that ask for it by name. In `pii_entities_config`, `MASK` swaps the text for a placeholder and `BLOCK` refuses the request. Entities you add to Presidio yourself, such as a `PROJECT_CODENAME` from circuit-presidio's `analyzer_config`, go in the same map. LiteLLM's docs cover the rest, such as per-entity score thresholds and `output_parse_pii`, which puts the original values back into the answer.
+
+Masking happens before LiteLLM logs the request, so with `log_prompts` on, a Langfuse trace holds the masked text, not the original. If Presidio is down, LiteLLM refuses the request with a `500` rather than send it unmasked.
+
+Presidio misses things; its own maintainers say there's no guarantee it finds everything. Treat it as one layer. As with `models`, a credential in a guardrail's `litellm_params`, such as `api_key` for a hosted guardrail, has to be an `os.environ/NAME` reference to `api_keys`.
+
+### Traces in Langfuse
+
+Set `langfuse_url` and LiteLLM sends a trace of every model call to a [Langfuse](https://github.com/conn3xorg/circuit-langfuse) you run: which model answered, how many tokens it took, what it cost and how long it ran. The project's keys go in `api_keys`, so they reach the host's env file and never the plan or state:
+
+```hcl
+module "litellm" {
+  # ...as above, and:
+  langfuse_url = "http://127.0.0.1:3000"
+  api_keys = {
+    OPENAI_API_KEY      = var.openai_api_key
+    LANGFUSE_PUBLIC_KEY = "pk-lf-gateway"
+    LANGFUSE_SECRET_KEY = var.langfuse_secret_key
+  }
+}
+```
+
+`http://127.0.0.1:3000` is circuit-langfuse's default on the same host; for a Langfuse elsewhere, use its `public_url`. The plan stops if `langfuse_url` is set without both keys.
+
+The circuit adds `langfuse_otel` to `litellm_settings.callbacks`, alongside any you set there, and gives LiteLLM `LANGFUSE_OTEL_HOST`. LiteLLM then sends OpenTelemetry to `/api/public/otel`, which is how Langfuse 3 and 4 take traces. Don't use LiteLLM's older `langfuse` callback with circuit-langfuse: it goes through Langfuse's ingestion API, which a new Langfuse 4 install refuses for traces.
+
+What a trace holds follows `log_prompts`:
+
+- **Off, the default.** The circuit sets `turn_off_message_logging`, and each trace's input and output read `redacted-by-litellm`. Model, tokens, cost and timing are all there.
+- **On.** The trace holds the request's messages and the answer, after any guardrail has masked them.
+
+`turn_off_message_logging` applies to every callback, not only Langfuse. To decide separately, set it yourself in `litellm_settings`, which wins.
+
+LiteLLM also has a newer OpenTelemetry logger, turned on with `LITELLM_OTEL_V2`, which its docs recommend for Langfuse. The circuit doesn't use it: in v1.106.6 it also prints every span inside the proxy, guardrail findings among them, to the journal.
+
 ### TLS with Caddy
 
 LiteLLM speaks plain HTTP. [circuit-caddy](https://github.com/conn3xorg/circuit-caddy) on the same host can put a certificate in front of it:
@@ -183,7 +252,7 @@ LiteLLM sends no telemetry when you host it yourself; its [data security page](h
 
 The one thing it does fetch by default is its list of model prices, from GitHub, each time it starts. The circuit turns that off, with `LITELLM_LOCAL_MODEL_COST_MAP=True`, so LiteLLM prices requests from the list in the image instead and needs nothing but your providers at runtime. The list is as new as `litellm_version`: LiteLLM can't price a model released after it, and counts it as free, until you upgrade or give it `input_cost_per_token` and `output_cost_per_token` in `litellm_params`. Set `fetch_model_prices = true` for the live list.
 
-No callbacks are set, so nothing is sent to an observability service unless you add one in `litellm_settings`.
+No callbacks are set, so nothing is sent to an observability service unless you set `langfuse_url` or add one in `litellm_settings`.
 
 ## Why a container
 
@@ -205,7 +274,7 @@ On each host, in order:
 
 1. Creates `/etc/litellm`, mode `0700`, owned by root.
 2. If `/etc/litellm/keys.env` doesn't exist, writes it, mode `0600`: `LITELLM_MASTER_KEY` and `LITELLM_SALT_KEY`, each `sk-` and 32 random bytes from `/dev/urandom` in hex. Once the file exists the circuit never touches it again.
-3. Writes `/etc/litellm/config.yaml`, mode `0600`, from `models`, `general_settings`, `litellm_settings` and the logging and budget inputs. It holds no secrets.
+3. Writes `/etc/litellm/config.yaml`, mode `0600`, from `models`, `guardrails`, `general_settings`, `litellm_settings` and the logging, budget and Langfuse inputs. It holds no secrets.
 4. Through [circuit-podman](https://github.com/conn3xorg/circuit-podman) v0.1.0, installs Podman and runs `ghcr.io/berriai/litellm:VERSION@DIGEST` as `litellm.service`: a Quadlet unit on the host network that reads `keys.env`, mounts `config.yaml` read-only, and listens on `listen_address` and `port`. `db_connection_uri` and `api_keys` go to `/etc/containers/env/litellm.env`, mode `0600`, written from ephemeral values so they never reach the plan or state.
 5. Waits up to ten minutes for `/health/liveliness` to answer. On a first start LiteLLM pulls its image and migrates the database before it does.
 
@@ -245,7 +314,9 @@ The circuit sees the file and keeps it. Point `db_connection_uri` at the existin
 | `db_connection_uri` | string | Required | PostgreSQL connection URI, such as `"postgresql://litellm:PASSWORD@127.0.0.1:5432/litellm"`. Ephemeral and sensitive: it reaches the host's env file but never the plan or state. |
 | `models` | any | `[]` | LiteLLM's `model_list`: a list of `{ model_name, litellm_params }` objects. Credentials in `litellm_params` must be `os.environ/NAME` references to `api_keys`. |
 | `api_keys` | map(string) | `{}` | Provider credentials and other secret environment variables, such as `OPENAI_API_KEY`. Ephemeral and sensitive: they go to the env file and never the plan or state. `DATABASE_URL` and the two generated keys aren't allowed here. |
-| `log_prompts` | bool | `false` | Store each request and answer in the spend logs. See [What gets logged](#what-gets-logged). |
+| `guardrails` | any | `[]` | LiteLLM's `guardrails` list, such as a Presidio guardrail. See [Masking PII with Presidio](#masking-pii-with-presidio). Credentials in `litellm_params` must be `os.environ/NAME` references to `api_keys`. |
+| `langfuse_url` | string | `null` | Base URL of a Langfuse 3 or later to send traces to, such as `"http://127.0.0.1:3000"`. Needs `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` in `api_keys`. See [Traces in Langfuse](#traces-in-langfuse). |
+| `log_prompts` | bool | `false` | Store each request and answer in the spend logs and, with `langfuse_url`, in Langfuse traces. See [What gets logged](#what-gets-logged). |
 | `spend_logs` | bool | `true` | Write a spend log row per request. |
 | `default_key_budget` | number | `null` | Budget in US dollars for a key made without one. |
 | `max_key_budget` | number | `null` | Largest budget `/key/generate` accepts. |
@@ -270,13 +341,15 @@ The circuit sees the file and keeps it. Point `db_connection_uri` at the existin
 
 Requires Conn3x v0.6.9 or later and systemd on each host. The image is built for amd64 and arm64. Each host needs to reach its package mirror, GitHub's container registry and your model providers, and a PostgreSQL. `conn3x init` fetches circuit-podman from GitHub.
 
-LiteLLM used about 620 MB of memory in testing. With PostgreSQL beside it, it ran on 2 GB.
+LiteLLM used about 620 MB of memory in testing. With PostgreSQL beside it, it ran on 2 GB. Presidio's analyzer adds about 850 MB. circuit-langfuse plans on 4 GB by itself; LiteLLM, Presidio and Langfuse together ran on 8 GB.
 
 ## Tested on
 
-Rocky Linux 10, Fedora 45, Ubuntu 24.04 and Debian 13. CI applies [examples/local](examples/local) to each on amd64, with circuit-postgres on the same host, and checks that the second plan has no changes. It then runs a stand-in for an OpenAI-compatible provider, so no real API key is involved, and checks that `/health/liveliness` answers, that `/key/generate` refuses a wrong master key and a budget over `max_key_budget`, and that a key made for one model can use it, through the provider key that came in by `api_keys`, and gets a `403` for the other. The request has to show up in the spend logs in PostgreSQL with a price and without its content. After a restart, the same key works again, which needs the database and both generated keys unchanged. The same checks passed by hand on arm64 containers of all four.
+Rocky Linux 10, Fedora 45, Ubuntu 24.04 and Debian 13. CI applies [examples/local](examples/local) to each on amd64, with circuit-postgres and circuit-presidio on the same host, and checks that the second plan has no changes. It then runs a stand-in for an OpenAI-compatible provider, so no real API key is involved, and checks that `/health/liveliness` answers, that `/key/generate` refuses a wrong master key and a budget over `max_key_budget`, and that a key made for one model can use it, through the provider key that came in by `api_keys`, and gets a `403` for the other. The request has to show up in the spend logs in PostgreSQL with a price and without its content. A message with a name and an email address has to reach the stand-in with both masked by the Presidio guardrail. After a restart, the same key works again, which needs the database and both generated keys unchanged. The same checks, before the guardrail was added, passed by hand on arm64 containers of all four.
 
 They passed by hand on a Rocky Linux 10 droplet with 2 GB of memory and SELinux enforcing, too. An Ubuntu 24.04 droplet with 4 GB ran circuit-ollama beside it with `smollm2:135m`, and a team key limited to that model got an answer from it through LiteLLM. On both, port 4000 didn't answer from outside. After each of two reboots LiteLLM came back on its own, the second plan was clean, the Ubuntu team key from before still worked, and the CI checks passed again on Rocky. The Rocky audit log had no denials. Turning `log_prompts` on stored the next request and answer in the spend logs; turning it off restarted LiteLLM, and the apply waited until it answered.
+
+`guardrails` and `langfuse_url` were tested on two DigitalOcean droplets. On Rocky Linux 10 with 4 GB and SELinux enforcing, with circuit-presidio beside it, the CI checks passed, and the stand-in got `My name is <PERSON> and my email is <EMAIL_ADDRESS>`. After a reboot the masking still worked, the plan was clean and the audit log had no denials. With the analyzer stopped, the request got a `500` and never reached the stand-in. On Ubuntu 24.04 with 8 GB, LiteLLM ran beside circuit-presidio and circuit-langfuse, and each request showed up as a generation in Langfuse's `/api/public/v2/observations` within seconds, with model, tokens and cost. With `log_prompts` off its input and output read `redacted-by-litellm`; with it on, they held the masked prompt and the answer. The project keys weren't in the state.
 
 Upgrading from one `litellm_version` to the next hasn't been tried yet.
 

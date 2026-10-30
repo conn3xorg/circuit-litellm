@@ -1,6 +1,6 @@
 # Local example
 
-Applies circuit-litellm to a throwaway Rocky Linux 10 container with systemd, with [circuit-postgres](https://github.com/conn3xorg/circuit-postgres) on the same host. You need Conn3x and Podman.
+Applies circuit-litellm to a throwaway Rocky Linux 10 container with systemd, with [circuit-postgres](https://github.com/conn3xorg/circuit-postgres) and [circuit-presidio](https://github.com/conn3xorg/circuit-presidio) on the same host. A Presidio guardrail masks names and email addresses in every request before it reaches a model. You need Conn3x and Podman.
 
 LiteLLM runs under Podman inside that container, so the host container is privileged, which is simplest with rootful Podman. On a Mac, use the Podman machine's root connection. On Linux, use `sudo podman`:
 
@@ -13,7 +13,7 @@ conn3x apply
 conn3x plan
 ```
 
-The first apply takes a few minutes: it installs PostgreSQL and Podman, pulls LiteLLM's image and waits while LiteLLM sets up its database. The second plan says `No changes.` The example's database password is a default in `main.tf`, which you'd never keep on a real host.
+The first apply takes a few minutes: it installs PostgreSQL and Podman, pulls LiteLLM's and Presidio's images and waits while LiteLLM sets up its database. The second plan says `No changes.` The example's database password is a default in `main.tf`, which you'd never keep on a real host.
 
 The example has two models, `small` and `large`, and no real provider behind them. Both point at `127.0.0.1:9999`, where CI runs a stand-in that answers like OpenAI's API, so no API key is needed. To talk to a real model, change `models` and `api_keys` in `main.tf`, as in the [main README](../../README.md#usage).
 

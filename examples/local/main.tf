@@ -39,10 +39,20 @@ module "postgres" {
   databases      = { litellm = "litellm" }
 }
 
+# Presidio on the same host, for LiteLLM's guardrail.
+module "presidio" {
+  source = "github.com/conn3xorg/circuit-presidio?ref=v0.1.0"
+
+  hosts                = local.host
+  ssh_port             = var.port
+  ssh_private_key_file = "./id_ed25519"
+  ssh_known_hosts_file = "./known_hosts"
+}
+
 module "litellm" {
   source = "../.."
 
-  depends_on = [module.postgres]
+  depends_on = [module.postgres, module.presidio]
 
   hosts                = local.host
   ssh_port             = var.port
@@ -56,6 +66,21 @@ module "litellm" {
     { model_name = "large", litellm_params = local.stand_in },
   ]
   api_keys = { STAND_IN_API_KEY = "not-a-real-key" }
+
+  # Every request goes through Presidio first, and names and email
+  # addresses are masked before the model sees them.
+  guardrails = [{
+    guardrail_name = "presidio-pii"
+    litellm_params = {
+      guardrail                    = "presidio"
+      mode                         = "pre_call"
+      default_on                   = true
+      presidio_analyzer_api_base   = "http://127.0.0.1:5002"
+      presidio_anonymizer_api_base = "http://127.0.0.1:5001"
+      presidio_language            = "en"
+      pii_entities_config          = { PERSON = "MASK", EMAIL_ADDRESS = "MASK" }
+    }
+  }]
 
   default_key_budget = 1
   max_key_budget     = 10
