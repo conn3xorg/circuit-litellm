@@ -45,7 +45,7 @@ module "postgres" {
 }
 
 module "litellm" {
-  source = "github.com/conn3xorg/circuit-litellm?ref=v0.2.0"
+  source = "github.com/conn3xorg/circuit-litellm?ref=v0.2.1"
 
   depends_on = [module.postgres]
 
