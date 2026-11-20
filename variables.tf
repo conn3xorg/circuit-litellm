@@ -36,19 +36,19 @@ variable "ssh_become" {
 
 variable "litellm_version" {
   type        = string
-  default     = "v1.106.6"
-  description = "Tag of the ghcr.io/berriai/litellm image, such as \"v1.106.6\". Change image_digest with it."
+  default     = "v1.106.12"
+  description = "Tag of the ghcr.io/berriai/litellm image, such as \"v1.106.12\". Change image_digest with it."
 
   validation {
     condition     = can(regex("^[A-Za-z0-9_][A-Za-z0-9_.-]*$", var.litellm_version))
-    error_message = "litellm_version must be an image tag, such as \"v1.106.6\"."
+    error_message = "litellm_version must be an image tag, such as \"v1.106.12\"."
   }
 }
 
 variable "image_digest" {
   type        = string
-  default     = "sha256:37e2dafb088a7723beb998590682957386dfc83ffea1848486f8e0e5cfac0b06"
-  description = "Digest of the image for litellm_version, such as \"sha256:37e2...\". Podman pulls by the digest, so a tag that moves upstream can't change what runs."
+  default     = "sha256:416f6246a4be4f8fc782f0e64c5b1aaebe9a12501a23e33465c88298c0b1f131"
+  description = "Digest of the image for litellm_version, such as \"sha256:416f...\". Podman pulls by the digest, so a tag that moves upstream can't change what runs."
 
   validation {
     condition     = can(regex("^sha256:[a-f0-9]{64}$", var.image_digest))
