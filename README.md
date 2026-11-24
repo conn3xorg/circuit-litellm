@@ -326,8 +326,8 @@ The circuit sees the file and keeps it. Point `db_connection_uri` at the existin
 | `fetch_model_prices` | bool | `false` | Fetch LiteLLM's model prices from GitHub at each start, rather than use the list in the image. |
 | `general_settings` | any | `{}` | More of LiteLLM's [`general_settings`](https://docs.litellm.ai/docs/proxy/config_settings), merged over the circuit's at the top level. Not for secrets: it's in the plan and state. `master_key` and `database_url` aren't allowed. |
 | `litellm_settings` | any | `{}` | More of LiteLLM's `litellm_settings`, merged over the circuit's at the top level, such as `{ drop_params = false }`. The circuit sets `drop_params = true`, so a parameter a provider doesn't support is dropped instead of failing the request. |
-| `litellm_version` | string | `"v1.106.12"` | Tag of `ghcr.io/berriai/litellm`. Change `image_digest` with it. |
-| `image_digest` | string | `"sha256:416f6246..."` | Digest of the image for `litellm_version`. Podman pulls by the digest. Find it with `skopeo inspect docker://ghcr.io/berriai/litellm:TAG` or on the [package page](https://github.com/BerriAI/litellm/pkgs/container/litellm). |
+| `litellm_version` | string | `"v1.110.2"` | Tag of `ghcr.io/berriai/litellm`. Change `image_digest` with it. |
+| `image_digest` | string | `"sha256:ef798594..."` | Digest of the image for `litellm_version`. Podman pulls by the digest. Find it with `skopeo inspect docker://ghcr.io/berriai/litellm:TAG` or on the [package page](https://github.com/BerriAI/litellm/pkgs/container/litellm). |
 | `listen_address` | string | `"127.0.0.1"` | Address LiteLLM listens on. `"0.0.0.0"` listens on every address. |
 | `port` | number | `4000` | Port LiteLLM listens on. |
 
